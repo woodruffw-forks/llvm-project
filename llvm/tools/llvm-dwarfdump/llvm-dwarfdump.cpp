@@ -12,6 +12,7 @@
 
 #include "llvm-dwarfdump.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/Triple.h"
 #include "llvm/DebugInfo/DIContext.h"
@@ -181,6 +182,15 @@ static list<std::string> Name(
     value_desc("pattern"), cat(DwarfDumpCategory));
 static alias NameAlias("n", desc("Alias for --name"), aliasopt(Name),
                        cl::NotHidden);
+
+static list<std::string>
+    Tag("tag",
+        desc("Find and print all debug info entries whose tag (DW_AT_tag "
+             "attribute) matches the exact text in <tag>."),
+        value_desc("tag"), cat(DwarfDumpCategory));
+static alias TypeAlias("t", desc("Alias for --tag"), aliasopt(Tag),
+                       cl::NotHidden);
+
 static opt<uint64_t>
     Lookup("lookup",
            desc("Lookup <address> in the debug information and print out any "
@@ -325,47 +335,11 @@ static bool filterArch(ObjectFile &Obj) {
 using HandlerFn = std::function<bool(ObjectFile &, DWARFContext &DICtx,
                                      const Twine &, raw_ostream &)>;
 
-/// Print only DIEs that have a certain name.
-static bool filterByName(const StringSet<> &Names, DWARFDie Die,
-                         StringRef NameRef, raw_ostream &OS) {
-  DIDumpOptions DumpOpts = getDumpOpts(Die.getDwarfUnit()->getContext());
-  std::string Name =
-      (IgnoreCase && !UseRegex) ? NameRef.lower() : NameRef.str();
-  if (UseRegex) {
-    // Match regular expression.
-    for (auto Pattern : Names.keys()) {
-      Regex RE(Pattern, IgnoreCase ? Regex::IgnoreCase : Regex::NoFlags);
-      std::string Error;
-      if (!RE.isValid(Error)) {
-        errs() << "error in regular expression: " << Error << "\n";
-        exit(1);
-      }
-      if (RE.match(Name)) {
-        Die.dump(OS, 0, DumpOpts);
-        return true;
-      }
-    }
-  } else if (Names.count(Name)) {
-    // Match full text.
-    Die.dump(OS, 0, DumpOpts);
-    return true;
-  }
-  return false;
-}
-
-/// Print only DIEs that have a certain name.
-static void filterByName(const StringSet<> &Names,
-                         DWARFContext::unit_iterator_range CUs,
-                         raw_ostream &OS) {
+static void getDies(DWARFContext::unit_iterator_range CUs,
+                    SmallVectorImpl<DWARFDie> &Dies) {
   for (const auto &CU : CUs)
-    for (const auto &Entry : CU->dies()) {
-      DWARFDie Die = {CU.get(), &Entry};
-      if (const char *Name = Die.getName(DINameKind::ShortName))
-        if (filterByName(Names, Die, Name, OS))
-          continue;
-      if (const char *Name = Die.getName(DINameKind::LinkageName))
-        filterByName(Names, Die, Name, OS);
-    }
+    for (const auto &Entry : CU->dies())
+      Dies.push_back({CU.get(), &Entry});
 }
 
 static void getDies(DWARFContext &DICtx, const AppleAcceleratorTable &Accel,
@@ -456,6 +430,41 @@ static bool lookup(ObjectFile &Obj, DWARFContext &DICtx, uint64_t Address,
   return true;
 }
 
+/// Return true if a name in `Names` matches `NameRef`.
+static bool filterByName(const StringSet<> &Names, StringRef NameRef) {
+  std::string Name =
+      (IgnoreCase && !UseRegex) ? NameRef.lower() : NameRef.str();
+  if (UseRegex) {
+    // Match regular expression.
+    for (auto Pattern : Names.keys()) {
+      Regex RE(Pattern, IgnoreCase ? Regex::IgnoreCase : Regex::NoFlags);
+      std::string Error;
+      if (!RE.isValid(Error)) {
+        errs() << "error in regular expression: " << Error << "\n";
+        exit(1);
+      }
+      if (RE.match(Name)) {
+        return true;
+      }
+    }
+  } else if (Names.count(Name)) {
+    // Match full text.
+    return true;
+  }
+  return false;
+}
+
+static bool dieFilter(const StringSet<> &Names,
+                      const SmallSet<unsigned, 8> &Tags, const DWARFDie &Die) {
+  if (const char *Name = Die.getName(DINameKind::ShortName))
+    if (filterByName(Names, Name))
+      return true;
+  if (const char *Name = Die.getName(DINameKind::LinkageName))
+    if (filterByName(Names, Name))
+      return true;
+  return Tags.count(Die.getTag());
+}
+
 static bool dumpObjectFile(ObjectFile &Obj, DWARFContext &DICtx,
                            const Twine &Filename, raw_ostream &OS) {
   logAllUnhandledErrors(DICtx.loadRegisterInfo(Obj), errs(),
@@ -468,14 +477,24 @@ static bool dumpObjectFile(ObjectFile &Obj, DWARFContext &DICtx,
   if (Lookup)
     return lookup(Obj, DICtx, Lookup, OS);
 
-  // Handle the --name option.
-  if (!Name.empty()) {
+  // Handle the --name and --tag options.
+  if (!Name.empty() || !Tag.empty()) {
     StringSet<> Names;
     for (auto name : Name)
       Names.insert((IgnoreCase && !UseRegex) ? StringRef(name).lower() : name);
 
-    filterByName(Names, DICtx.normal_units(), OS);
-    filterByName(Names, DICtx.dwo_units(), OS);
+    SmallSet<unsigned, 8> Tags;
+    for (auto tag : Tag)
+      Tags.insert(dwarf::getTag(StringRef("DW_TAG_" + StringRef(tag).lower())));
+
+    SmallVector<DWARFDie> Dies;
+    getDies(DICtx.normal_units(), Dies);
+    getDies(DICtx.dwo_units(), Dies);
+
+    auto Filter = [&](DWARFDie Die) { return dieFilter(Names, Tags, Die); };
+    for (const auto Die : make_filter_range(Dies, Filter))
+      Die.dump(OS, 0, getDumpOpts(DICtx));
+
     return true;
   }
 
